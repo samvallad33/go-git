@@ -629,27 +629,14 @@ func TestHandshakeClosesBodyOnErrorStatus(t *testing.T) {
 	}
 }
 
-// decoderFunc adapts a function to packp.Decoder, so a test can observe when
-// a command's decode returns.
-type decoderFunc func(io.Reader) error
-
-func (f decoderFunc) Decode(r io.Reader) error { return f(r) }
-
-// TestCommandKeepsConnection covers the discard a v2 command owes the request
-// that follows it. The decoder stops at the response's flush-pkt, so the
-// terminating chunk is still outstanding when the command is done, and closing
-// there costs the fetch POST after an ls-refs a connection of its own.
-func TestCommandKeepsConnection(t *testing.T) {
+func TestCommandReadToEOFKeepsConnection(t *testing.T) {
 	t.Parallel()
 
 	const ref = "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 refs/heads/master\n"
 	body := pktLine(ref) + "0000"
 
-	// Sent after the client has decoded the flush-pkt. Written in the same
-	// flush as the refs, the terminating chunk is already buffered when the
-	// decoder takes the last packet, and net/http's chunked reader consumes
-	// it without being asked — which a server on a real network does not
-	// oblige.
+	// Delay HTTP EOF until decoding ends: a Git flush-pkt does not end the
+	// HTTP body.
 	decoded := make(chan struct{}, 1)
 	srv, conns := connCountingServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -678,18 +665,69 @@ func TestCommandKeepsConnection(t *testing.T) {
 	const commands = 10
 	for range commands {
 		out := &packp.LsRefsOutput{}
-		err := session.Command(context.Background(), "ls-refs", &packp.LsRefsArgs{},
-			decoderFunc(func(rd io.Reader) error {
-				err := out.Decode(rd)
-				decoded <- struct{}{}
-				return err
-			}))
+		rc, err := session.Command(context.Background(), "ls-refs", &packp.LsRefsArgs{})
 		require.NoError(t, err)
+		defer func() { _ = rc.Close() }()
+		err = out.Decode(rc)
+		decoded <- struct{}{}
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
 		require.Len(t, out.References, 1)
 	}
 
 	assert.Equal(t, int64(1), conns.Load(),
 		"%d commands on one session must share one connection", commands)
+}
+
+func TestCommandResponseCleanup(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name      string
+		reply     string
+		public    bool
+		wantError bool
+	}{
+		{name: "public close does not drain", reply: "0000", public: true},
+		{name: "ls-refs success does not drain", reply: pktLine("6ecf0ef2c2dffb796033e5a02219af86ec6584e5 refs/heads/main\n") + "0000"},
+		{name: "ls-refs error does not drain", reply: "xxxx", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tail := &countingBody{remaining: bodySize}
+			body := &trackedBody{Reader: io.MultiReader(strings.NewReader(tt.reply), tail)}
+			u, err := url.Parse("http://example.test/repo.git")
+			require.NoError(t, err)
+			session := &smartPackSession{
+				sessionBase: sessionBase{
+					client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						return &http.Response{StatusCode: http.StatusOK, Body: body, Request: r}, nil
+					})},
+					baseURL: u,
+					service: transport.UploadPackService,
+				},
+				version: protocol.V2,
+			}
+			if tt.public {
+				rc, err := session.Command(context.Background(), "ls-refs", &packp.LsRefsArgs{})
+				require.NoError(t, err)
+				defer func() { _ = rc.Close() }()
+				require.NoError(t, (&packp.LsRefsOutput{}).Decode(rc))
+				require.NoError(t, rc.Close())
+			} else {
+				_, err := session.GetRemoteRefs(context.Background(), nil)
+				if tt.wantError {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			assert.True(t, body.closed.Load())
+			assert.Zero(t, tail.read)
+		})
+	}
 }
 
 // TestNegotiatorReleasesPreviousRound covers the one drain in the package: the
